@@ -1,152 +1,55 @@
 # Vendor Boot Ramdisk Fix
 
-A comprehensive solution for fixing and optimizing vendor boot ramdisk configurations on Android devices.
+A GitHub Actions workflow that fixes a `vendor_boot.img` which is missing its **system/platform ramdisk** — a common issue on custom ROM builds where the recovery ramdisk is present, but the platform ramdisk was not generated correctly.
 
-## Table of Contents
+This is a generic tool: it is **not tied to any specific device**. It works on any `vendor_boot.img` using the standard Android boot image header v3/v4 layout (i.e. any device where `magiskboot` can unpack/repack the vendor_boot).
 
-- [Overview](#overview)
-- [Features](#features)
-- [Requirements](#requirements)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Configuration](#configuration)
-- [Contributing](#contributing)
-- [License](#license)
-- [Support](#support)
+## The problem
 
-## Overview
+When building a custom ROM, sometimes the resulting `vendor_boot.img` boots into recovery mode instead of the OS, or bootloops, because the **platform (system) ramdisk** is missing or empty — only the `recovery` ramdisk got packed in. Flashing this image as-is will not boot the OS correctly.
 
-This project provides tools and utilities to diagnose, repair, and optimize vendor boot ramdisk issues commonly encountered in Android device development and customization. It addresses compatibility issues, boot failures, and ramdisk corruption problems.
+## The fix
 
-## Features
+You provide two images:
 
-- 🔧 Automated vendor boot ramdisk detection and repair
-- 📋 Comprehensive diagnostics and logging
-- 🚀 Quick boot optimization
-- 🛡️ Backup and recovery functionality
-- 📱 Support for multiple Android device architectures
-- ⚙️ Configurable repair profiles
-- 🔍 Detailed error reporting and troubleshooting
+1. **Built vendor_boot** — the one you built, which has a valid `recovery` ramdisk but is missing (or has a broken) platform ramdisk.
+2. **Reference (stock) vendor_boot** — any known-good vendor_boot for your device (e.g. extracted from a stock/official ROM), used only as the source of a correct platform ramdisk.
 
-## Requirements
+The workflow:
 
-- **Operating System**: Linux/macOS/Windows with WSL
-- **Tools**: 
-  - Android SDK Platform Tools
-  - Relevant device drivers
-  - Build tools (if compiling from source)
-- **Hardware**: USB cable for device connection (for direct testing)
-- **Permissions**: Root/Administrator access for certain operations
+1. Downloads both images from direct links you provide.
+2. Unpacks both using `magiskboot`.
+3. Takes the **platform/system ramdisk** from the reference image.
+4. Takes the **recovery ramdisk** from the built image, untouched.
+5. Keeps the **DTB** from the built image as-is (falls back to the reference DTB only if the built one is missing or empty).
+6. Repacks everything into `vendor_boot_fixed.img`.
+7. Pads/truncates the output to exactly match the reference image's size, so it fits the device's vendor_boot partition.
+8. Uploads `vendor_boot_fixed.img` as a workflow artifact.
 
-## Installation
-
-### Clone the Repository
-
-```bash
-git clone https://github.com/mkvenompro/vendor_boot_ramdisk_fix.git
-cd vendor_boot_ramdisk_fix
-```
-
-### Setup
-
-```bash
-# Give execute permissions
-chmod +x *.sh
-
-# Install dependencies (if applicable)
-./install.sh
-```
+Nothing inside `recovery.cpio` is modified, and the DTB is never touched — only the platform ramdisk is swapped in.
 
 ## Usage
 
-### Basic Usage
+1. Go to the **Actions** tab → **Fix Vendor Boot (ramdisk)** workflow.
+2. Click **Run workflow**.
+3. Provide:
+   - `built_vendor_boot_url` — a direct download link to your built `vendor_boot.img`.
+   - `reference_vendor_boot_url` — a direct download link to a known-good/stock `vendor_boot.img` for the same device.
+4. Run the workflow and wait for it to finish.
+5. Download `vendor_boot_fixed.img` from the workflow's **Artifacts** section.
+6. Flash it:
+   ```
+   fastboot flash vendor_boot vendor_boot_fixed.img
+   ```
 
-```bash
-# Run the main fix utility
-./vendor_boot_ramdisk_fix.sh
+## Requirements / notes
 
-# Display help and available options
-./vendor_boot_ramdisk_fix.sh --help
-```
+- Both links must be **direct, publicly accessible download links** (not pages requiring login) — the workflow uses `wget` to fetch them.
+- The two images should be from the **same device**, and ideally the same boot header version, or the repack step may fail or produce an unbootable image.
+- The final output size is matched to the reference image's size (padded with zeros or truncated) so it fits the target partition.
+- If the built image's platform ramdisk is genuinely fine, you don't need this tool — it's specifically for the "recovery ramdisk present, platform ramdisk missing/broken" case.
+- Repacking can take a few minutes depending on the size of the recovery ramdisk, since `magiskboot` compresses it with LZMA.
 
-### Common Operations
+## Credits
 
-**Diagnose Issues:**
-```bash
-./vendor_boot_ramdisk_fix.sh --diagnose
-```
-
-**Apply Fix:**
-```bash
-./vendor_boot_ramdisk_fix.sh --fix
-```
-
-**Backup Current Configuration:**
-```bash
-./vendor_boot_ramdisk_fix.sh --backup <backup-name>
-```
-
-**Restore from Backup:**
-```bash
-./vendor_boot_ramdisk_fix.sh --restore <backup-name>
-```
-
-## Configuration
-
-Configuration files are typically located in the `config/` directory. Customize settings based on your device model and requirements:
-
-- **Device Profile**: Select appropriate device model configuration
-- **Repair Profile**: Choose from standard, aggressive, or custom repair modes
-- **Logging Level**: Set verbosity for diagnostic output
-- **Backup Location**: Specify where backups should be stored
-
-Example configuration:
-```
-DEVICE_MODEL=model_name
-REPAIR_MODE=standard
-LOG_LEVEL=verbose
-BACKUP_DIR=./backups
-```
-
-## Contributing
-
-Contributions are welcome! To contribute:
-
-1. **Fork** the repository
-2. **Create** a feature branch (`git checkout -b feature/amazing-fix`)
-3. **Commit** your changes (`git commit -m 'Add amazing fix'`)
-4. **Push** to the branch (`git push origin feature/amazing-fix`)
-5. **Open** a Pull Request with a clear description
-
-Please ensure your contributions:
-- Follow the existing code style
-- Include appropriate documentation
-- Add tests for new features
-- Update the README if necessary
-
-## License
-
-This project is licensed under the MIT License. See the LICENSE file for details.
-
-## Support
-
-### Troubleshooting
-
-If you encounter issues:
-
-1. Check the [GitHub Issues](https://github.com/mkvenompro/vendor_boot_ramdisk_fix/issues) for similar problems
-2. Review the diagnostic output and logs
-3. Consult the troubleshooting section in the documentation
-4. Create a new issue with detailed error information and logs
-
-### Getting Help
-
-- **Documentation**: Check the `/docs` directory for detailed guides
-- **Issues**: Open a GitHub Issue with your problem
-- **Discussions**: Use GitHub Discussions for general questions
-
----
-
-**Note**: Always backup your current configuration before applying any fixes. This tool modifies critical system files.
-
-**Disclaimer**: Use at your own risk. Improper use may result in device malfunction. Ensure you understand the implications before proceeding.
+Workflow based on the original `fix_vendor_boot.sh` script by [@mkvenompro](https://github.com/mkvenompro).
