@@ -35,9 +35,11 @@ jobs:
           echo "Magisk APK: $APK_URL"
           curl -fsSL -o magisk.apk "$APK_URL"
           mkdir -p extracted
-          unzip -q -o magisk.apk "lib/arm64-v8a/libmagiskboot.so" -d extracted
-          sudo cp extracted/lib/arm64-v8a/libmagiskboot.so /usr/local/bin/magiskboot
+          # GitHub Actions runners are x86_64, so we need the x86_64 native lib, not arm64-v8a
+          unzip -q -o magisk.apk "lib/x86_64/libmagiskboot.so" -d extracted
+          sudo cp extracted/lib/x86_64/libmagiskboot.so /usr/local/bin/magiskboot
           sudo chmod 755 /usr/local/bin/magiskboot
+          file /usr/local/bin/magiskboot
           magiskboot --help || true
 
       - name: Unpack built and reference images
