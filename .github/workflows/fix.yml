@@ -1,4 +1,4 @@
-name: Fix Vendor Boot (SPINEL)
+name: Fix Vendor Boot (ramdisk)
 
 on:
   workflow_dispatch:
