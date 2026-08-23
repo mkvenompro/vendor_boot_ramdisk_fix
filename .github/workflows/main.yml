@@ -1,0 +1,146 @@
+name: Fix Vendor Boot (SPINEL)
+
+on:
+  workflow_dispatch:
+    inputs:
+      built_vendor_boot_url:
+        description: "Direct link to the BUILT vendor_boot.img (missing system ramdisk, has recovery)"
+        required: true
+        type: string
+      reference_vendor_boot_url:
+        description: "Direct link to the REFERENCE (stock) vendor_boot.img (source of system ramdisk)"
+        required: true
+        type: string
+
+jobs:
+  fix-vendor-boot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download built vendor_boot
+        run: |
+          wget -q --show-progress -O built_vendor_boot.img "${{ inputs.built_vendor_boot_url }}"
+          echo "built size: $(stat -c%s built_vendor_boot.img) bytes"
+
+      - name: Download reference (stock) vendor_boot
+        run: |
+          wget -q --show-progress -O reference_vendor_boot.img "${{ inputs.reference_vendor_boot_url }}"
+          echo "reference size: $(stat -c%s reference_vendor_boot.img) bytes"
+
+      - name: Install magiskboot
+        run: |
+          set -e
+          APK_URL=$(curl -fsSL "https://api.github.com/repos/topjohnwu/Magisk/releases/latest" \
+            | grep -o '"browser_download_url": *"[^"]*\.apk"' | head -1 \
+            | sed 's/.*"browser_download_url": *"\(.*\)"/\1/')
+          echo "Magisk APK: $APK_URL"
+          curl -fsSL -o magisk.apk "$APK_URL"
+          mkdir -p extracted
+          unzip -q -o magisk.apk "lib/arm64-v8a/libmagiskboot.so" -d extracted
+          sudo cp extracted/lib/arm64-v8a/libmagiskboot.so /usr/local/bin/magiskboot
+          sudo chmod 755 /usr/local/bin/magiskboot
+          magiskboot --help || true
+
+      - name: Unpack built and reference images
+        run: |
+          set -e
+          mkdir -p work/built work/ref
+
+          cd work/built
+          magiskboot unpack "$GITHUB_WORKSPACE/built_vendor_boot.img" || true
+          cd "$GITHUB_WORKSPACE"
+
+          cd work/ref
+          magiskboot unpack "$GITHUB_WORKSPACE/reference_vendor_boot.img" || true
+          cd "$GITHUB_WORKSPACE"
+
+          echo "=== built unpacked ==="
+          ls -la work/built/vendor_ramdisk/ || true
+          echo "=== reference unpacked ==="
+          ls -la work/ref/vendor_ramdisk/ || true
+
+      - name: Assemble combined vendor_ramdisk
+        run: |
+          set -e
+          mkdir -p out_comb/vendor_ramdisk
+          cp -a work/built/vendor_ramdisk/. out_comb/ 2>/dev/null || true
+          cp -f work/built/*.bin out_comb/ 2>/dev/null || true
+          cp -f work/built/dtb out_comb/ 2>/dev/null || true
+
+          # system/platform ramdisk from reference
+          REF_PLATFORM=""
+          for cand in work/ref/vendor_ramdisk/ramdisk.cpio work/ref/vendor_ramdisk/platform.cpio; do
+            if [ -f "$cand" ]; then REF_PLATFORM="$cand"; break; fi
+          done
+          if [ -z "$REF_PLATFORM" ]; then
+            echo "No system/platform ramdisk found inside the reference image"; exit 1
+          fi
+          cp -f "$REF_PLATFORM" out_comb/vendor_ramdisk/ramdisk.cpio
+
+          # recovery from built (untouched)
+          REC_RAW=""
+          for cand in work/built/vendor_ramdisk/recovery.cpio work/built/vendor_ramdisk/recovery.cpio.gz work/built/vendor_ramdisk/recovery.cpio.lz4; do
+            if [ -f "$cand" ]; then REC_RAW="$cand"; break; fi
+          done
+          if [ -z "$REC_RAW" ]; then
+            echo "No recovery.cpio found inside the built image"; exit 1
+          fi
+          cp -f "$REC_RAW" out_comb/vendor_ramdisk/recovery.cpio
+
+          rm -f out_comb/vendor_ramdisk/*.gz out_comb/vendor_ramdisk/*.lz4 2>/dev/null || true
+
+          # dtb: keep the built image's dtb, fallback to reference if missing/empty
+          if [ -f work/built/dtb ] && [ "$(stat -c%s work/built/dtb)" -gt 0 ]; then
+            cp -f work/built/dtb out_comb/dtb
+            echo "DTB: keeping built image's dtb ($(stat -c%s out_comb/dtb) bytes)"
+          elif [ -f work/ref/dtb ]; then
+            cp -f work/ref/dtb out_comb/dtb
+            echo "DTB: built dtb missing/empty, falling back to reference dtb"
+          else
+            echo "No dtb present in either image — cannot continue safely"; exit 1
+          fi
+
+          echo "=== final vendor_ramdisk ==="
+          ls -la out_comb/vendor_ramdisk/
+
+      - name: Repack
+        run: |
+          set -e
+          cd out_comb
+          magiskboot repack "$GITHUB_WORKSPACE/built_vendor_boot.img" "$GITHUB_WORKSPACE/vendor_boot_fixed.img"
+          cd "$GITHUB_WORKSPACE"
+          test -f vendor_boot_fixed.img
+
+      - name: Verify and pad to reference size
+        run: |
+          set -e
+          mkdir -p verify
+          cd verify
+          magiskboot unpack "$GITHUB_WORKSPACE/vendor_boot_fixed.img" || true
+          cd "$GITHUB_WORKSPACE"
+
+          SIZE=$(stat -c%s vendor_boot_fixed.img)
+          LIMIT=$((64*1024*1024))
+          echo "final size before padding: $SIZE bytes (limit: $LIMIT bytes)"
+          if [ "$SIZE" -gt "$LIMIT" ]; then
+            echo "WARNING: output exceeds the 64 MB partition limit"
+          fi
+
+          REF_SIZE=$(stat -c%s reference_vendor_boot.img)
+          OUT_SIZE=$(stat -c%s vendor_boot_fixed.img)
+          if [ "$REF_SIZE" -gt "$OUT_SIZE" ]; then
+            PAD=$((REF_SIZE - OUT_SIZE))
+            echo "Padding output to match reference size ($OUT_SIZE -> $REF_SIZE bytes, +$PAD)"
+            dd if=/dev/zero of=vendor_boot_fixed.img bs=1048576 count=$((PAD/1048576)) oflag=append conv=notrunc 2>/dev/null || true
+            REM=$((PAD % 1048576))
+            [ "$REM" -gt 0 ] && dd if=/dev/zero of=vendor_boot_fixed.img bs=1 count="$REM" oflag=append conv=notrunc 2>/dev/null
+          elif [ "$REF_SIZE" -lt "$OUT_SIZE" ]; then
+            echo "Output larger than reference, truncating to reference size"
+            truncate -s "$REF_SIZE" vendor_boot_fixed.img
+          fi
+          echo "Final size: $(stat -c%s vendor_boot_fixed.img) bytes (reference: $REF_SIZE bytes)"
+
+      - name: Upload vendor_boot_fixed.img
+        uses: actions/upload-artifact@v4
+        with:
+          name: vendor_boot_fixed
+          path: vendor_boot_fixed.img
