@@ -1,19 +1,19 @@
 # Vendor Boot Ramdisk Fix
 
-A GitHub Actions workflow that fixes a `vendor_boot.img` which is missing its **system/platform ramdisk** — a common issue on custom ROM builds where the recovery ramdisk is present, but the platform ramdisk was not generated correctly.
+A GitHub Actions workflow that fixes a `vendor_boot.img` which is missing its **system/platform ramdisk** — this happens when building a recovery (TWRP / OrangeFox) that lives *inside* `vendor_boot.img` as `recovery.cpio`. The build only produces the `recovery.cpio`; the `ramdisk.cpio` (the platform ramdisk responsible for booting the actual OS) comes out empty, so the image can't boot into the system — only into recovery.
 
-This is a generic tool: it is **not tied to any specific device**. It works on any `vendor_boot.img` using the standard Android boot image header v3/v4 layout (i.e. any device where `magiskboot` can unpack/repack the vendor_boot).
+This is a generic tool: it is **not tied to any specific device**, and it's **not related to custom ROM building**. It works on any `vendor_boot.img` using the standard Android boot image header v3/v4 layout (i.e. any device where `magiskboot` can unpack/repack the vendor_boot), for anyone building a TWRP/OrangeFox that's packed into vendor_boot.
 
 ## The problem
 
-When building a custom ROM, sometimes the resulting `vendor_boot.img` boots into recovery mode instead of the OS, or bootloops, because the **platform (system) ramdisk** is missing or empty — only the `recovery` ramdisk got packed in. Flashing this image as-is will not boot the OS correctly.
+Some devices ship TWRP/OrangeFox as a `recovery.cpio` inside `vendor_boot.img` instead of a separate `recovery.img`. When you build that recovery, the build only outputs a valid `recovery.cpio` — the `ramdisk.cpio` (platform ramdisk, needed to boot the OS) is left empty. Flashing that vendor_boot as-is means the device can no longer boot into the OS, only into recovery.
 
 ## The fix
 
 You provide two images:
 
-1. **Built vendor_boot** — the one you built, which has a valid `recovery` ramdisk but is missing (or has a broken) platform ramdisk.
-2. **Reference (stock) vendor_boot** — any known-good vendor_boot for your device (e.g. extracted from a stock/official ROM), used only as the source of a correct platform ramdisk.
+1. **Built vendor_boot** — the one you built (TWRP/OrangeFox), which has a valid `recovery` ramdisk but an empty/broken platform ramdisk.
+2. **Reference (stock) vendor_boot** — the stock vendor_boot for your device, used only as the source of a correct platform ramdisk.
 
 The workflow:
 
@@ -47,7 +47,7 @@ Nothing inside `recovery.cpio` is modified, and the DTB is never touched — onl
 - Both links must be **direct, publicly accessible download links** (not pages requiring login) — the workflow uses `wget` to fetch them.
 - The two images should be from the **same device**, and ideally the same boot header version, or the repack step may fail or produce an unbootable image.
 - The final output size is matched to the reference image's size (padded with zeros or truncated) so it fits the target partition.
-- If the built image's platform ramdisk is genuinely fine, you don't need this tool — it's specifically for the "recovery ramdisk present, platform ramdisk missing/broken" case.
+- If your built image's platform ramdisk is genuinely fine, you don't need this tool — it's specifically for the "recovery.cpio built, ramdisk.cpio empty" case that comes up when packing TWRP/OrangeFox into vendor_boot.
 - Repacking can take a few minutes depending on the size of the recovery ramdisk, since `magiskboot` compresses it with LZMA.
 
 ## Credits
