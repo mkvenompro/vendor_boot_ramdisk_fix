@@ -22,6 +22,10 @@ jobs:
           wget -q --show-progress -O built_vendor_boot.img "${{ inputs.built_vendor_boot_url }}"
           echo "built size: $(stat -c%s built_vendor_boot.img) bytes"
           file built_vendor_boot.img
+          echo "=== first 64 bytes (hex) ==="
+          xxd -l 64 built_vendor_boot.img
+          echo "=== magic string check ==="
+          head -c 8 built_vendor_boot.img | strings
 
       - name: Download reference (stock) vendor_boot
         run: |
@@ -29,6 +33,10 @@ jobs:
           wget -q --show-progress -O reference_vendor_boot.img "${{ inputs.reference_vendor_boot_url }}"
           echo "reference size: $(stat -c%s reference_vendor_boot.img) bytes"
           file reference_vendor_boot.img
+          echo "=== first 64 bytes (hex) ==="
+          xxd -l 64 reference_vendor_boot.img
+          echo "=== magic string check ==="
+          head -c 8 reference_vendor_boot.img | strings
 
       - name: Install magiskboot
         run: |
@@ -48,31 +56,35 @@ jobs:
         run: |
           set -e
           mkdir -p work/built work/ref
+          cp built_vendor_boot.img work/built/
+          cp reference_vendor_boot.img work/ref/
 
           echo "=== unpacking built ==="
-          cp built_vendor_boot.img work/built/
-          ( cd work/built && magiskboot unpack built_vendor_boot.img )
+          set +e
+          ( cd work/built && magiskboot unpack built_vendor_boot.img 2>&1 )
           BUILT_STATUS=$?
+          set -e
           echo "built unpack exit code: $BUILT_STATUS"
-
-          echo "=== unpacking reference ==="
-          cp reference_vendor_boot.img work/ref/
-          ( cd work/ref && magiskboot unpack reference_vendor_boot.img )
-          REF_STATUS=$?
-          echo "reference unpack exit code: $REF_STATUS"
-
-          echo "=== built unpacked (cwd = work/built) ==="
+          echo "--- work/built contents ---"
           ls -la work/built/
 
-          echo "=== reference unpacked (cwd = work/ref) ==="
+          echo "=== unpacking reference ==="
+          set +e
+          ( cd work/ref && magiskboot unpack reference_vendor_boot.img 2>&1 )
+          REF_STATUS=$?
+          set -e
+          echo "reference unpack exit code: $REF_STATUS"
+          echo "--- work/ref contents ---"
           ls -la work/ref/
 
           if [ "$BUILT_STATUS" -ne 0 ]; then
-            echo "::error::magiskboot failed to unpack the built image — it may not be a valid vendor_boot.img"
+            echo "::error::magiskboot failed to unpack the built image (exit $BUILT_STATUS)."
+            echo "This usually means the file is not a valid vendor_boot image (wrong URL, corrupted download, or unsupported header version)."
+            echo "Check the hex dump / magic bytes printed in the 'Download built vendor_boot' step above."
             exit 1
           fi
           if [ "$REF_STATUS" -ne 0 ]; then
-            echo "::error::magiskboot failed to unpack the reference image"
+            echo "::error::magiskboot failed to unpack the reference image (exit $REF_STATUS)."
             exit 1
           fi
 
@@ -80,13 +92,9 @@ jobs:
         run: |
           set -e
           mkdir -p out_comb
-          # start from everything magiskboot extracted from the BUILT image
-          # (kernel, dtb, bootconfig, recovery.cpio, ramdisk.cpio if any, etc.)
           cp -a work/built/. out_comb/
           rm -f out_comb/built_vendor_boot.img
 
-          # system/platform ramdisk must come from the REFERENCE image.
-          # magiskboot names the platform-type vendor ramdisk "ramdisk.cpio"
           if [ ! -f work/ref/ramdisk.cpio ]; then
             echo "::error::No ramdisk.cpio (platform) found in unpacked reference image"
             ls -la work/ref/
@@ -95,7 +103,6 @@ jobs:
           cp -f work/ref/ramdisk.cpio out_comb/ramdisk.cpio
           echo "Copied platform ramdisk from reference: $(stat -c%s out_comb/ramdisk.cpio) bytes"
 
-          # recovery ramdisk must stay the one from the BUILT image, untouched
           if [ ! -f out_comb/recovery.cpio ]; then
             echo "::error::No recovery.cpio found in unpacked built image"
             ls -la work/built/
@@ -103,7 +110,6 @@ jobs:
           fi
           echo "Keeping recovery ramdisk from built: $(stat -c%s out_comb/recovery.cpio) bytes"
 
-          # dtb: keep built's dtb, fallback to reference if missing/empty
           if [ -f work/built/dtb ] && [ "$(stat -c%s work/built/dtb)" -gt 0 ]; then
             cp -f work/built/dtb out_comb/dtb
             echo "DTB: keeping built image's dtb ($(stat -c%s out_comb/dtb) bytes)"
@@ -130,8 +136,13 @@ jobs:
         run: |
           set -e
           mkdir -p verify
-          ( cd verify && magiskboot unpack "$GITHUB_WORKSPACE/vendor_boot_fixed.img" ) || \
-            echo "::warning::could not re-unpack fixed image for verification"
+          set +e
+          ( cd verify && magiskboot unpack "$GITHUB_WORKSPACE/vendor_boot_fixed.img" 2>&1 )
+          VERIFY_STATUS=$?
+          set -e
+          if [ "$VERIFY_STATUS" -ne 0 ]; then
+            echo "::warning::could not re-unpack fixed image for verification (exit $VERIFY_STATUS)"
+          fi
 
           SIZE=$(stat -c%s vendor_boot_fixed.img)
           LIMIT=$((64*1024*1024))
@@ -154,8 +165,33 @@ jobs:
           fi
           echo "Final size: $(stat -c%s vendor_boot_fixed.img) bytes (reference: $REF_SIZE bytes)"
 
-      - name: Upload vendor_boot_fixed.img
+      - name: Upload vendor_boot_fixed.img (artifact)
         uses: actions/upload-artifact@v4
         with:
           name: vendor_boot_fixed
           path: vendor_boot_fixed.img
+
+      - name: Upload to Gofile
+        run: |
+          set -e
+          echo "Fetching best Gofile server..."
+          SERVER=$(curl -fsSL "https://api.gofile.io/servers" | grep -o '"name":"[^"]*"' | head -1 | cut -d'"' -f4)
+          if [ -z "$SERVER" ]; then
+            echo "::error::Could not fetch a Gofile server"
+            exit 1
+          fi
+          echo "Using server: $SERVER"
+
+          RESPONSE=$(curl -fsSL -X POST "https://${SERVER}.gofile.io/contents/uploadfile" \
+            -F "file=@vendor_boot_fixed.img")
+          echo "Gofile response: $RESPONSE"
+
+          DOWNLOAD_PAGE=$(echo "$RESPONSE" | grep -o '"downloadPage":"[^"]*"' | cut -d'"' -f4 | sed 's/\\//g')
+          if [ -z "$DOWNLOAD_PAGE" ]; then
+            echo "::error::Gofile upload failed, no downloadPage in response"
+            exit 1
+          fi
+
+          echo "Gofile link: $DOWNLOAD_PAGE"
+          echo "### 📦 Gofile download link" >> "$GITHUB_STEP_SUMMARY"
+          echo "$DOWNLOAD_PAGE" >> "$GITHUB_STEP_SUMMARY"
