@@ -18,13 +18,17 @@ jobs:
     steps:
       - name: Download built vendor_boot
         run: |
+          set -e
           wget -q --show-progress -O built_vendor_boot.img "${{ inputs.built_vendor_boot_url }}"
           echo "built size: $(stat -c%s built_vendor_boot.img) bytes"
+          file built_vendor_boot.img
 
       - name: Download reference (stock) vendor_boot
         run: |
+          set -e
           wget -q --show-progress -O reference_vendor_boot.img "${{ inputs.reference_vendor_boot_url }}"
           echo "reference size: $(stat -c%s reference_vendor_boot.img) bytes"
+          file reference_vendor_boot.img
 
       - name: Install magiskboot
         run: |
@@ -35,62 +39,71 @@ jobs:
           echo "Magisk APK: $APK_URL"
           curl -fsSL -o magisk.apk "$APK_URL"
           mkdir -p extracted
-          # GitHub Actions runners are x86_64, so we need the x86_64 native lib, not arm64-v8a
           unzip -q -o magisk.apk "lib/x86_64/libmagiskboot.so" -d extracted
           sudo cp extracted/lib/x86_64/libmagiskboot.so /usr/local/bin/magiskboot
           sudo chmod 755 /usr/local/bin/magiskboot
           file /usr/local/bin/magiskboot
-          magiskboot --help || true
 
       - name: Unpack built and reference images
         run: |
           set -e
           mkdir -p work/built work/ref
 
-          cd work/built
-          magiskboot unpack "$GITHUB_WORKSPACE/built_vendor_boot.img" || true
-          cd "$GITHUB_WORKSPACE"
+          echo "=== unpacking built ==="
+          cp built_vendor_boot.img work/built/
+          ( cd work/built && magiskboot unpack built_vendor_boot.img )
+          BUILT_STATUS=$?
+          echo "built unpack exit code: $BUILT_STATUS"
 
-          cd work/ref
-          magiskboot unpack "$GITHUB_WORKSPACE/reference_vendor_boot.img" || true
-          cd "$GITHUB_WORKSPACE"
+          echo "=== unpacking reference ==="
+          cp reference_vendor_boot.img work/ref/
+          ( cd work/ref && magiskboot unpack reference_vendor_boot.img )
+          REF_STATUS=$?
+          echo "reference unpack exit code: $REF_STATUS"
 
-          echo "=== built unpacked ==="
-          ls -la work/built/vendor_ramdisk/ || true
-          echo "=== reference unpacked ==="
-          ls -la work/ref/vendor_ramdisk/ || true
+          echo "=== built unpacked (cwd = work/built) ==="
+          ls -la work/built/
 
-      - name: Assemble combined vendor_ramdisk
+          echo "=== reference unpacked (cwd = work/ref) ==="
+          ls -la work/ref/
+
+          if [ "$BUILT_STATUS" -ne 0 ]; then
+            echo "::error::magiskboot failed to unpack the built image — it may not be a valid vendor_boot.img"
+            exit 1
+          fi
+          if [ "$REF_STATUS" -ne 0 ]; then
+            echo "::error::magiskboot failed to unpack the reference image"
+            exit 1
+          fi
+
+      - name: Assemble combined output directory
         run: |
           set -e
-          mkdir -p out_comb/vendor_ramdisk
-          cp -a work/built/vendor_ramdisk/. out_comb/ 2>/dev/null || true
-          cp -f work/built/*.bin out_comb/ 2>/dev/null || true
-          cp -f work/built/dtb out_comb/ 2>/dev/null || true
+          mkdir -p out_comb
+          # start from everything magiskboot extracted from the BUILT image
+          # (kernel, dtb, bootconfig, recovery.cpio, ramdisk.cpio if any, etc.)
+          cp -a work/built/. out_comb/
+          rm -f out_comb/built_vendor_boot.img
 
-          # system/platform ramdisk from reference
-          REF_PLATFORM=""
-          for cand in work/ref/vendor_ramdisk/ramdisk.cpio work/ref/vendor_ramdisk/platform.cpio; do
-            if [ -f "$cand" ]; then REF_PLATFORM="$cand"; break; fi
-          done
-          if [ -z "$REF_PLATFORM" ]; then
-            echo "No system/platform ramdisk found inside the reference image"; exit 1
+          # system/platform ramdisk must come from the REFERENCE image.
+          # magiskboot names the platform-type vendor ramdisk "ramdisk.cpio"
+          if [ ! -f work/ref/ramdisk.cpio ]; then
+            echo "::error::No ramdisk.cpio (platform) found in unpacked reference image"
+            ls -la work/ref/
+            exit 1
           fi
-          cp -f "$REF_PLATFORM" out_comb/vendor_ramdisk/ramdisk.cpio
+          cp -f work/ref/ramdisk.cpio out_comb/ramdisk.cpio
+          echo "Copied platform ramdisk from reference: $(stat -c%s out_comb/ramdisk.cpio) bytes"
 
-          # recovery from built (untouched)
-          REC_RAW=""
-          for cand in work/built/vendor_ramdisk/recovery.cpio work/built/vendor_ramdisk/recovery.cpio.gz work/built/vendor_ramdisk/recovery.cpio.lz4; do
-            if [ -f "$cand" ]; then REC_RAW="$cand"; break; fi
-          done
-          if [ -z "$REC_RAW" ]; then
-            echo "No recovery.cpio found inside the built image"; exit 1
+          # recovery ramdisk must stay the one from the BUILT image, untouched
+          if [ ! -f out_comb/recovery.cpio ]; then
+            echo "::error::No recovery.cpio found in unpacked built image"
+            ls -la work/built/
+            exit 1
           fi
-          cp -f "$REC_RAW" out_comb/vendor_ramdisk/recovery.cpio
+          echo "Keeping recovery ramdisk from built: $(stat -c%s out_comb/recovery.cpio) bytes"
 
-          rm -f out_comb/vendor_ramdisk/*.gz out_comb/vendor_ramdisk/*.lz4 2>/dev/null || true
-
-          # dtb: keep the built image's dtb, fallback to reference if missing/empty
+          # dtb: keep built's dtb, fallback to reference if missing/empty
           if [ -f work/built/dtb ] && [ "$(stat -c%s work/built/dtb)" -gt 0 ]; then
             cp -f work/built/dtb out_comb/dtb
             echo "DTB: keeping built image's dtb ($(stat -c%s out_comb/dtb) bytes)"
@@ -98,33 +111,33 @@ jobs:
             cp -f work/ref/dtb out_comb/dtb
             echo "DTB: built dtb missing/empty, falling back to reference dtb"
           else
-            echo "No dtb present in either image — cannot continue safely"; exit 1
+            echo "No dtb present in either image — continuing without one"
           fi
 
-          echo "=== final vendor_ramdisk ==="
-          ls -la out_comb/vendor_ramdisk/
+          echo "=== final combined directory ==="
+          ls -la out_comb/
 
       - name: Repack
         run: |
           set -e
           cd out_comb
-          magiskboot repack "$GITHUB_WORKSPACE/built_vendor_boot.img" "$GITHUB_WORKSPACE/vendor_boot_fixed.img"
+          magiskboot repack built_vendor_boot.img "$GITHUB_WORKSPACE/vendor_boot_fixed.img"
           cd "$GITHUB_WORKSPACE"
           test -f vendor_boot_fixed.img
+          echo "repacked size: $(stat -c%s vendor_boot_fixed.img) bytes"
 
       - name: Verify and pad to reference size
         run: |
           set -e
           mkdir -p verify
-          cd verify
-          magiskboot unpack "$GITHUB_WORKSPACE/vendor_boot_fixed.img" || true
-          cd "$GITHUB_WORKSPACE"
+          ( cd verify && magiskboot unpack "$GITHUB_WORKSPACE/vendor_boot_fixed.img" ) || \
+            echo "::warning::could not re-unpack fixed image for verification"
 
           SIZE=$(stat -c%s vendor_boot_fixed.img)
           LIMIT=$((64*1024*1024))
           echo "final size before padding: $SIZE bytes (limit: $LIMIT bytes)"
           if [ "$SIZE" -gt "$LIMIT" ]; then
-            echo "WARNING: output exceeds the 64 MB partition limit"
+            echo "::warning::output exceeds the 64 MB partition limit"
           fi
 
           REF_SIZE=$(stat -c%s reference_vendor_boot.img)
@@ -132,7 +145,7 @@ jobs:
           if [ "$REF_SIZE" -gt "$OUT_SIZE" ]; then
             PAD=$((REF_SIZE - OUT_SIZE))
             echo "Padding output to match reference size ($OUT_SIZE -> $REF_SIZE bytes, +$PAD)"
-            dd if=/dev/zero of=vendor_boot_fixed.img bs=1048576 count=$((PAD/1048576)) oflag=append conv=notrunc 2>/dev/null || true
+            dd if=/dev/zero of=vendor_boot_fixed.img bs=1M count=$((PAD/1048576)) oflag=append conv=notrunc 2>/dev/null || true
             REM=$((PAD % 1048576))
             [ "$REM" -gt 0 ] && dd if=/dev/zero of=vendor_boot_fixed.img bs=1 count="$REM" oflag=append conv=notrunc 2>/dev/null
           elif [ "$REF_SIZE" -lt "$OUT_SIZE" ]; then
