@@ -16,19 +16,37 @@ jobs:
   fix-vendor-boot:
     runs-on: ubuntu-latest
     steps:
+      - name: Get Gofile guest token
+        id: gofile_auth
+        run: |
+          set -e
+          RESP=$(curl -fsSL -X POST "https://api.gofile.io/accounts")
+          echo "$RESP"
+          TOKEN=$(echo "$RESP" | grep -o '"token":"[^"]*"' | head -1 | cut -d'"' -f4)
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Could not obtain Gofile guest token"
+            exit 1
+          fi
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+          echo "Got guest token (hidden)"
+
       - name: Download built vendor_boot
         run: |
           set -e
-          wget -q --show-progress -O built_vendor_boot.img "${{ inputs.built_vendor_boot_url }}"
+          TOKEN="${{ steps.gofile_auth.outputs.token }}"
+          wget -q --show-progress \
+            --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
+            --header="Cookie: accountToken=${TOKEN}" \
+            -O built_vendor_boot.img "${{ inputs.built_vendor_boot_url }}"
+
           SIZE=$(stat -c%s built_vendor_boot.img)
           echo "built size: $SIZE bytes"
           file built_vendor_boot.img
 
           MIN_SIZE=$((1*1024*1024))
           if [ "$SIZE" -lt "$MIN_SIZE" ]; then
-            echo "::error::Downloaded built_vendor_boot.img is only $SIZE bytes — this is NOT a real vendor_boot image."
-            echo "The link is probably expired, wrong, or points to an HTML/error page instead of the raw file."
-            echo "=== dumped content (likely the real problem) ==="
+            echo "::error::Downloaded built_vendor_boot.img is only $SIZE bytes — not a real vendor_boot image."
+            echo "=== dumped content ==="
             cat built_vendor_boot.img
             exit 1
           fi
@@ -36,7 +54,7 @@ jobs:
           MAGIC=$(head -c 8 built_vendor_boot.img | tr -d '\0')
           echo "magic bytes: $MAGIC"
           if [ "$MAGIC" != "VNDRBOOT" ]; then
-            echo "::error::built_vendor_boot.img does not start with VNDRBOOT magic (got: '$MAGIC'). Not a valid vendor_boot image."
+            echo "::error::built_vendor_boot.img does not start with VNDRBOOT magic (got: '$MAGIC')."
             xxd -l 32 built_vendor_boot.img
             exit 1
           fi
@@ -44,7 +62,12 @@ jobs:
       - name: Download reference (stock) vendor_boot
         run: |
           set -e
-          wget -q --show-progress -O reference_vendor_boot.img "${{ inputs.reference_vendor_boot_url }}"
+          TOKEN="${{ steps.gofile_auth.outputs.token }}"
+          wget -q --show-progress \
+            --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
+            --header="Cookie: accountToken=${TOKEN}" \
+            -O reference_vendor_boot.img "${{ inputs.reference_vendor_boot_url }}"
+
           SIZE=$(stat -c%s reference_vendor_boot.img)
           echo "reference size: $SIZE bytes"
           file reference_vendor_boot.img
@@ -103,12 +126,10 @@ jobs:
           echo "--- work/ref (recursive) ---"
           find work/ref -type f -exec ls -la {} \;
 
-          # magiskboot can return non-zero (e.g. 3) even when it produced valid output
-          # (seen for HEADER_VER 4 vendor_boot with fragmented vendor ramdisk table),
-          # so verify by checking that expected files actually exist, not just the exit code.
+          # magiskboot can return non-zero even when it produced valid output,
+          # so verify by checking that expected files actually exist.
           if [ ! -f work/built/vendor_ramdisk/recovery.cpio ] && [ ! -f work/built/recovery.cpio ]; then
             echo "::error::magiskboot did not produce a recovery.cpio from the built image (exit $BUILT_STATUS)."
-            echo "The built_vendor_boot.img is likely corrupted, truncated, or not a real vendor_boot image."
             exit 1
           fi
           if [ ! -f work/ref/vendor_ramdisk/ramdisk.cpio ] && [ ! -f work/ref/ramdisk.cpio ]; then
@@ -123,7 +144,6 @@ jobs:
           cp -a work/built out_comb
           rm -f out_comb/built_vendor_boot.img
 
-          # locate platform ramdisk in reference (may be at top level or inside vendor_ramdisk/)
           REF_PLATFORM=""
           for cand in work/ref/vendor_ramdisk/ramdisk.cpio work/ref/ramdisk.cpio; do
             [ -f "$cand" ] && REF_PLATFORM="$cand" && break
@@ -134,7 +154,6 @@ jobs:
             exit 1
           fi
 
-          # locate matching destination path inside out_comb (mirror ref's layout)
           if [ -d out_comb/vendor_ramdisk ]; then
             DEST_PLATFORM="out_comb/vendor_ramdisk/ramdisk.cpio"
           else
@@ -144,7 +163,6 @@ jobs:
           cp -f "$REF_PLATFORM" "$DEST_PLATFORM"
           echo "Copied platform ramdisk from reference -> $DEST_PLATFORM ($(stat -c%s "$DEST_PLATFORM") bytes)"
 
-          # confirm recovery ramdisk from built is present untouched
           BUILT_RECOVERY=""
           for cand in out_comb/vendor_ramdisk/recovery.cpio out_comb/recovery.cpio; do
             [ -f "$cand" ] && BUILT_RECOVERY="$cand" && break
@@ -156,7 +174,6 @@ jobs:
           fi
           echo "Keeping recovery ramdisk from built: $BUILT_RECOVERY ($(stat -c%s "$BUILT_RECOVERY") bytes)"
 
-          # dtb: keep built's dtb, fallback to reference if missing/empty
           if [ -f work/built/dtb ] && [ "$(stat -c%s work/built/dtb)" -gt 0 ]; then
             cp -f work/built/dtb out_comb/dtb
             echo "DTB: keeping built image's dtb ($(stat -c%s out_comb/dtb) bytes)"
