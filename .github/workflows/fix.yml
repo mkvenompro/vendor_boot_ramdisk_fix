@@ -1,9 +1,163 @@
-- name: Assemble combined output directory
+name: Fix Vendor Boot (ramdisk)
+
+on:
+  workflow_dispatch:
+    inputs:
+      built_vendor_boot_url:
+        description: "Direct link to the BUILT vendor_boot.img (missing system ramdisk, has recovery)"
+        required: true
+        type: string
+      reference_vendor_boot_url:
+        description: "Direct link to the REFERENCE (stock) vendor_boot.img (source of system ramdisk)"
+        required: true
+        type: string
+
+jobs:
+  fix-vendor-boot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get Gofile guest token (used only if a URL is from gofile.io)
+        id: gofile_auth
+        run: |
+          set -e
+          RESP=$(curl -fsSL -X POST "https://api.gofile.io/accounts")
+          TOKEN=$(echo "$RESP" | grep -o '"token":"[^"]*"' | head -1 | cut -d'"' -f4)
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+          if [ -z "$TOKEN" ]; then
+            echo "::warning::Could not obtain Gofile guest token — fine if neither URL is from gofile.io"
+          fi
+
+      - name: Download built vendor_boot
+        run: |
+          set -e
+          URL="${{ inputs.built_vendor_boot_url }}"
+          TOKEN="${{ steps.gofile_auth.outputs.token }}"
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+          if echo "$URL" | grep -qi "gofile.io"; then
+            echo "::warning::Detected Gofile URL. Gofile only serves direct downloads to donor (paid) accounts — guest/free accounts get redirected to an HTML page."
+            wget -q --show-progress --user-agent="$UA" --header="Cookie: accountToken=${TOKEN}" -O built_vendor_boot.img "$URL"
+          elif echo "$URL" | grep -qiE "github\.com|githubusercontent\.com"; then
+            echo "Detected GitHub URL, plain direct download"
+            wget -q --show-progress --user-agent="$UA" -O built_vendor_boot.img "$URL"
+          else
+            echo "Generic URL, plain direct download"
+            wget -q --show-progress --user-agent="$UA" -O built_vendor_boot.img "$URL"
+          fi
+
+          SIZE=$(stat -c%s built_vendor_boot.img)
+          echo "built size: $SIZE bytes"
+          file built_vendor_boot.img
+
+          MIN_SIZE=$((1*1024*1024))
+          if [ "$SIZE" -lt "$MIN_SIZE" ]; then
+            echo "::error::Downloaded built_vendor_boot.img is only $SIZE bytes — not a real vendor_boot image."
+            echo "=== dumped content (first 2KB) ==="
+            head -c 2048 built_vendor_boot.img
+            exit 1
+          fi
+
+          MAGIC=$(head -c 8 built_vendor_boot.img | tr -d '\0')
+          echo "magic bytes: $MAGIC"
+          if [ "$MAGIC" != "VNDRBOOT" ]; then
+            echo "::error::built_vendor_boot.img does not start with VNDRBOOT magic (got: '$MAGIC')."
+            xxd -l 32 built_vendor_boot.img
+            exit 1
+          fi
+
+      - name: Download reference (stock) vendor_boot
+        run: |
+          set -e
+          URL="${{ inputs.reference_vendor_boot_url }}"
+          TOKEN="${{ steps.gofile_auth.outputs.token }}"
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+          if echo "$URL" | grep -qi "gofile.io"; then
+            echo "::warning::Detected Gofile URL. Gofile only serves direct downloads to donor (paid) accounts — guest/free accounts get redirected to an HTML page."
+            wget -q --show-progress --user-agent="$UA" --header="Cookie: accountToken=${TOKEN}" -O reference_vendor_boot.img "$URL"
+          elif echo "$URL" | grep -qiE "github\.com|githubusercontent\.com"; then
+            echo "Detected GitHub URL, plain direct download"
+            wget -q --show-progress --user-agent="$UA" -O reference_vendor_boot.img "$URL"
+          else
+            echo "Generic URL, plain direct download"
+            wget -q --show-progress --user-agent="$UA" -O reference_vendor_boot.img "$URL"
+          fi
+
+          SIZE=$(stat -c%s reference_vendor_boot.img)
+          echo "reference size: $SIZE bytes"
+          file reference_vendor_boot.img
+
+          MIN_SIZE=$((1*1024*1024))
+          if [ "$SIZE" -lt "$MIN_SIZE" ]; then
+            echo "::error::Downloaded reference_vendor_boot.img is only $SIZE bytes — not a real vendor_boot image."
+            head -c 2048 reference_vendor_boot.img
+            exit 1
+          fi
+
+          MAGIC=$(head -c 8 reference_vendor_boot.img | tr -d '\0')
+          echo "magic bytes: $MAGIC"
+          if [ "$MAGIC" != "VNDRBOOT" ]; then
+            echo "::error::reference_vendor_boot.img does not start with VNDRBOOT magic (got: '$MAGIC')."
+            xxd -l 32 reference_vendor_boot.img
+            exit 1
+          fi
+
+      - name: Install magiskboot
+        run: |
+          set -e
+          APK_URL=$(curl -fsSL "https://api.github.com/repos/topjohnwu/Magisk/releases/latest" \
+            | grep -o '"browser_download_url": *"[^"]*\.apk"' | head -1 \
+            | sed 's/.*"browser_download_url": *"\(.*\)"/\1/')
+          echo "Magisk APK: $APK_URL"
+          curl -fsSL -o magisk.apk "$APK_URL"
+          mkdir -p extracted
+          unzip -q -o magisk.apk "lib/x86_64/libmagiskboot.so" -d extracted
+          sudo cp extracted/lib/x86_64/libmagiskboot.so /usr/local/bin/magiskboot
+          sudo chmod 755 /usr/local/bin/magiskboot
+          file /usr/local/bin/magiskboot
+
+      - name: Unpack built and reference images
+        run: |
+          set -e
+          mkdir -p work/built work/ref
+          cp built_vendor_boot.img work/built/
+          cp reference_vendor_boot.img work/ref/
+
+          echo "=== unpacking built ==="
+          set +e
+          ( cd work/built && magiskboot unpack built_vendor_boot.img 2>&1 )
+          BUILT_STATUS=$?
+          set -e
+          echo "built unpack exit code: $BUILT_STATUS"
+          echo "--- work/built (recursive) ---"
+          find work/built -type f -exec ls -la {} \;
+
+          echo "=== unpacking reference ==="
+          set +e
+          ( cd work/ref && magiskboot unpack reference_vendor_boot.img 2>&1 )
+          REF_STATUS=$?
+          set -e
+          echo "reference unpack exit code: $REF_STATUS"
+          echo "--- work/ref (recursive) ---"
+          find work/ref -type f -exec ls -la {} \;
+
+          # magiskboot can return non-zero even when it produced valid output,
+          # so verify by checking that expected files actually exist.
+          if [ ! -f work/built/vendor_ramdisk/recovery.cpio ] && [ ! -f work/built/recovery.cpio ]; then
+            echo "::error::magiskboot did not produce a recovery.cpio from the built image (exit $BUILT_STATUS)."
+            exit 1
+          fi
+          if [ ! -f work/ref/vendor_ramdisk/ramdisk.cpio ] && [ ! -f work/ref/ramdisk.cpio ]; then
+            echo "::error::magiskboot did not produce a ramdisk.cpio (platform) from the reference image (exit $REF_STATUS)."
+            exit 1
+          fi
+
+      - name: Assemble combined output directory
         run: |
           set -e
           rm -rf out_comb
           cp -a work/built out_comb
-          # keep built_vendor_boot.img in place — magiskboot repack needs it as the header template
+          # keep built_vendor_boot.img in out_comb — magiskboot repack needs it as the header template
 
           REF_PLATFORM=""
           for cand in work/ref/vendor_ramdisk/ramdisk.cpio work/ref/ramdisk.cpio; do
@@ -57,3 +211,65 @@
           cd "$GITHUB_WORKSPACE"
           test -f vendor_boot_fixed.img
           echo "repacked size: $(stat -c%s vendor_boot_fixed.img) bytes"
+
+      - name: Verify and pad to reference size
+        run: |
+          set -e
+          mkdir -p verify
+          set +e
+          ( cd verify && magiskboot unpack "$GITHUB_WORKSPACE/vendor_boot_fixed.img" 2>&1 )
+          VERIFY_STATUS=$?
+          set -e
+          echo "verify unpack exit code: $VERIFY_STATUS"
+
+          SIZE=$(stat -c%s vendor_boot_fixed.img)
+          LIMIT=$((64*1024*1024))
+          echo "final size before padding: $SIZE bytes (limit: $LIMIT bytes)"
+          if [ "$SIZE" -gt "$LIMIT" ]; then
+            echo "::warning::output exceeds the 64 MB partition limit"
+          fi
+
+          REF_SIZE=$(stat -c%s reference_vendor_boot.img)
+          OUT_SIZE=$(stat -c%s vendor_boot_fixed.img)
+          if [ "$REF_SIZE" -gt "$OUT_SIZE" ]; then
+            PAD=$((REF_SIZE - OUT_SIZE))
+            echo "Padding output to match reference size ($OUT_SIZE -> $REF_SIZE bytes, +$PAD)"
+            dd if=/dev/zero of=vendor_boot_fixed.img bs=1M count=$((PAD/1048576)) oflag=append conv=notrunc 2>/dev/null || true
+            REM=$((PAD % 1048576))
+            [ "$REM" -gt 0 ] && dd if=/dev/zero of=vendor_boot_fixed.img bs=1 count="$REM" oflag=append conv=notrunc 2>/dev/null
+          elif [ "$REF_SIZE" -lt "$OUT_SIZE" ]; then
+            echo "Output larger than reference, truncating to reference size"
+            truncate -s "$REF_SIZE" vendor_boot_fixed.img
+          fi
+          echo "Final size: $(stat -c%s vendor_boot_fixed.img) bytes (reference: $REF_SIZE bytes)"
+
+      - name: Upload vendor_boot_fixed.img (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: vendor_boot_fixed
+          path: vendor_boot_fixed.img
+
+      - name: Upload to Gofile
+        run: |
+          set -e
+          echo "Fetching best Gofile server..."
+          SERVER=$(curl -fsSL "https://api.gofile.io/servers" | grep -o '"name":"[^"]*"' | head -1 | cut -d'"' -f4)
+          if [ -z "$SERVER" ]; then
+            echo "::error::Could not fetch a Gofile server"
+            exit 1
+          fi
+          echo "Using server: $SERVER"
+
+          RESPONSE=$(curl -fsSL -X POST "https://${SERVER}.gofile.io/contents/uploadfile" \
+            -F "file=@vendor_boot_fixed.img")
+          echo "Gofile response: $RESPONSE"
+
+          DOWNLOAD_PAGE=$(echo "$RESPONSE" | grep -o '"downloadPage":"[^"]*"' | cut -d'"' -f4 | sed 's/\\//g')
+          if [ -z "$DOWNLOAD_PAGE" ]; then
+            echo "::error::Gofile upload failed, no downloadPage in response"
+            exit 1
+          fi
+
+          echo "Gofile link: $DOWNLOAD_PAGE"
+          echo "### 📦 Gofile download link" >> "$GITHUB_STEP_SUMMARY"
+          echo "$DOWNLOAD_PAGE" >> "$GITHUB_STEP_SUMMARY"
